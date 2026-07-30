@@ -1,7 +1,12 @@
 """Phase 5 — join, check, and write the deliverables.
 
-Two outputs on purpose: JSONL keeps the nested shape so a field wanted three
-weeks from now needs no recrawl, CSV is what a person opens.
+Three outputs on purpose. JSONL keeps the nested shape so a field wanted three
+weeks from now needs no recrawl. XLSX is what a person opens: the content fields
+run to paragraphs and contain their own line breaks, and a spreadsheet that
+mis-reads one quoted newline shears every following column onto the wrong row —
+which is exactly what Google Sheets did to the CSV. XLSX carries the cell
+boundaries in the format itself, so there is nothing to mis-detect. The CSV
+stays for anything that wants to read it as a stream.
 """
 
 from __future__ import annotations
@@ -15,6 +20,9 @@ from pathlib import Path
 
 import pandas as pd
 from rapidfuzz import fuzz
+
+sys.path.insert(0, str(Path(__file__).parent))
+from sheet import write_sheet  # noqa: E402
 
 CONTENT_FIELDS = [
     "product_information", "features", "country_of_origin", "nutritional_data",
@@ -61,7 +69,17 @@ def flatten(value: object) -> str:
         if "markdown" in value:
             return str(value.get("markdown", ""))[:FLAT_LIMIT]
         return json.dumps(value, ensure_ascii=False)[:FLAT_LIMIT]
-    return str(value)[:FLAT_LIMIT]
+    return str(value)
+
+
+def one_line(value: object) -> str:
+    """Same as flatten, with the internal line breaks turned into separators.
+
+    A record has to occupy exactly one line for the CSV to survive a reader that
+    ignores quoting. The nested JSONL keeps the real breaks.
+    """
+    text = flatten(value)
+    return " / ".join(part.strip() for part in text.splitlines() if part.strip())[:FLAT_LIMIT]
 
 
 def quality_checks(record: dict) -> list[str]:
@@ -105,6 +123,14 @@ def quality_checks(record: dict) -> list[str]:
             flags.append("title_mismatch")
 
     return flags
+
+
+# The columns that answer "is this the same product?", moved to the front so the
+# check needs no scrolling.
+LEAD_COLUMNS = [
+    "input_name", "ocado_name", "input_size", "ocado_size",
+    "verify_status", "name_score", "quality_flags", "ocado_url",
+]
 
 
 def main() -> int:
@@ -160,8 +186,9 @@ def main() -> int:
         rows.append(record)
 
         flat.append({
-            **{k: v for k, v in record.items() if k not in CONTENT_FIELDS + ["quality_flags"]},
-            **{f: flatten(record.get(f)) for f in CONTENT_FIELDS},
+            **{k: one_line(v) for k, v in record.items()
+               if k not in CONTENT_FIELDS + ["quality_flags"]},
+            **{f: one_line(record.get(f)) for f in CONTENT_FIELDS},
             "quality_flags": "; ".join(record["quality_flags"]),
         })
 
@@ -171,7 +198,11 @@ def main() -> int:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     csv_path = args.out_dir / "ocado_content.csv"
-    pd.DataFrame(flat).to_csv(csv_path, index=False, encoding="utf-8-sig")
+    flat_df = pd.DataFrame(flat)
+    flat_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    xlsx_path = args.out_dir / "ocado_content.xlsx"
+    write_sheet(xlsx_path, flat_df, "products", LEAD_COLUMNS)
 
     coverage = {
         f: {"present": sum(1 for r in rows if r.get(f)),
@@ -188,7 +219,7 @@ def main() -> int:
     (args.out_dir / "quality_report.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    print(f"{len(rows)} products -> {jsonl_path.name}, {csv_path.name}\n")
+    print(f"{len(rows)} products -> {xlsx_path.name}, {jsonl_path.name}, {csv_path.name}\n")
     print(f"{'field':<24} {'present':>8} {'missing':>9}")
     for field, stat in coverage.items():
         warn = "  <-- check heading text" if stat["missing_pct"] > 20 else ""

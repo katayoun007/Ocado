@@ -55,6 +55,19 @@ def tokens(text: str) -> list[str]:
     return slug.split("-") if slug else []
 
 
+def words(text: str) -> str:
+    """The canonical form, space separated.
+
+    Slug form is right for comparing against Ocado's URLs and wrong for handing
+    to a token-based scorer: rapidfuzz splits on whitespace, so a hyphenated slug
+    arrives as a single token and token_set_ratio silently degrades to character
+    similarity. "serious-pig-snacking-pickles" against
+    "serious-pig-snacking-pickles-crunchy-tangy-mini-gherkins" scores 66.7 that
+    way and 100 — correctly, since the first is a subset of the second — this way.
+    """
+    return slugify(text).replace("-", " ")
+
+
 def _base(value: float, unit: str) -> tuple[str, float] | None:
     entry = _TO_BASE.get(unit.lower().rstrip("s") if unit.lower() != "s" else unit.lower())
     if entry is None:

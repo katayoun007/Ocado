@@ -83,16 +83,30 @@ and that test needs a length floor because "M&S" reduces to "ms", which is insid
 real brand in the name — "Brindisa Ortiz Yellowfin Tuna" — so the input's own
 leading word appearing in the page name counts as agreement too.
 
-**Rare words separate products; common words do not.** "La Costena Salsa
-Mexicana Casera" and "La Costena Salsa Ranchera" share brand and pack size and
-differ only in the last word. "El Yucateco Achiote Seasoning Paste" and "El
-Yucateco Achiote Paste" also differ by a word, and are the same product. What
-tells them apart is how rare the odd word is, measured against the catalogue.
-Measuring it also showed the rule cannot be allowed to reject: at the same
-rarity sit genuine pairs separated by a parent brand ("Nestle Carnation" /
-"Carnation"), a spelling ("Lemonade" / "Limonade") and pure tokenisation
-("Soy Bean" / "Soybean"). So it withholds `confirmed` and asks for a human,
-rather than throwing the product away.
+**A token scorer needs tokens.** `token_set_ratio` was being handed slug form,
+and rapidfuzz splits on whitespace, so `serious-pig-snacking-pickles` arrived as
+a single token and the scorer silently degraded to character similarity. That
+pair scored 66.7 against `serious-pig-snacking-pickles-crunchy-tangy-mini-gherkins`
+— the same product, one name simply fuller — where a real token comparison gives
+100. Everything downstream was calibrated on a number that was not measuring what
+it claimed. Passing space-separated form recovered 47 products, and it made the
+wrong matches score *lower*, not higher: "Salsa Mexicana Casera" against "Salsa
+Ranchera" fell from 80.7 to 78.
+
+**Which side the extra words are on decides it.** Rarity looked like the way to
+tell "Salsa Mexicana Casera" from "Achiote Seasoning Paste", and it is not: the
+words that actually fork a product line are usually ordinary ones — "Fig, Apple &
+Garlic Chutney" against "Peach & Mango Chutney", "Mushroom Soy Sauce" against
+"Fish Sauce" — while genuinely identical pairs were separated by rare ones, a
+parent brand ("Nestle Carnation" / "Carnation") or a spelling ("Lemonade" /
+"Limonade"). The shape of the disagreement separates them where rarity cannot.
+Both sides carrying a word the other lacks is a fork. Only Ocado carrying extra
+words is elaboration. Only the input carrying an extra word is a fork again if
+that word is distinctive, because it may be the product — "Rummo Mezze Penne
+Rigate" is a different shape from "Rummo Penne Rigate No. 66". None of it
+rejects: "Rio Mare Insalatissime Mexican Style Tuna Salad" and Ocado's "Rio Mare
+MSC Tuna Salad Mexican Style" diverge both ways and are the same tin, so
+divergence withholds `confirmed` and asks for a human.
 
 **The matching stage should not reject.** Slug similarity cannot distinguish a
 real match from a miss: "Regal Original Cake Rusks" scored 59.3 against Ocado's

@@ -20,7 +20,8 @@ import pandas as pd
 from rapidfuzz import fuzz
 
 sys.path.insert(0, str(Path(__file__).parent))
-from canon import extract_quantities, slugify, strip_quantities  # noqa: E402
+from canon import extract_quantities, slugify, strip_quantities, words  # noqa: E402
+from sheet import write_sheet  # noqa: E402
 
 NAME_CONFIRM = 80.0
 NAME_POSSIBLE = 60.0
@@ -63,16 +64,15 @@ VARIANT_AXES = [
     {"milk", "dark", "plain", "white", "black", "red", "green", "yellow", "brown"},
 ]
 
-# A word this rare, present on one side and absent from the other, is usually
-# the thing that distinguishes two products — "Salsa Mexicana Casera" against
-# "Salsa Ranchera". Usually, not always: the same measurement caught genuine
-# pairs separated only by a parent brand ("Nestle Carnation" / "Carnation") or a
-# spelling ("Lemonade" / "Limonade"), which is why this caps at review too.
+# Rarity is recorded to help whoever works the review queue, but it is not what
+# decides. Measuring it showed why: the words that actually fork a product line
+# are usually common ones — "Fig, Apple & Garlic Chutney" against "Peach & Mango
+# Chutney", "Mushroom Soy Sauce" against "Fish Sauce" — while genuinely
+# identical pairs were separated by rare ones, a parent brand ("Nestle
+# Carnation" / "Carnation") or a spelling ("Lemonade" / "Limonade").
 #
-# 7.5 rather than 8: it is the level that separates "Mezze Penne" from "Penne"
-# and "Less Salt" from "Original", both real differences. It also sends a few
-# genuine pairs to review ("of Modena", "Flame Grilled"), which is the cheaper
-# error of the two.
+# What separates them is the shape of the disagreement, not the rarity. See
+# divergence() below.
 RARE_TOKEN_IDF = 7.5
 
 PER_PACK = re.compile(r"\b(\d+)\s*per\s*pack\b", re.I)
@@ -196,11 +196,11 @@ def variant_conflict(input_name: str, page: dict) -> tuple[str, str]:
 def rare_divergence(input_name: str, page: dict, idf: dict[str, float],
                     ceiling: float) -> str:
     """The rarest word present on one side and absent from the other."""
-    a = name_tokens(input_name)
-    b = name_tokens(page.get("ocado_name", ""))
+    ja, jb = joined(input_name), joined(page.get("ocado_name", ""))
+    a, b = name_tokens(input_name), name_tokens(page.get("ocado_name", ""))
 
     worst, score = "", 0.0
-    for token in one_sided(a, b, joined(input_name), joined(page.get("ocado_name", ""))):
+    for token in one_sided(a, b, ja, jb):
         # Numbers and initials distinguish nothing on their own.
         if token.isdigit() or len(token) <= 2:
             continue
@@ -208,6 +208,38 @@ def rare_divergence(input_name: str, page: dict, idf: dict[str, float],
         if value > score:
             worst, score = token, value
     return worst if score >= RARE_TOKEN_IDF else ""
+
+
+def divergence(input_name: str, page: dict, idf: dict[str, float],
+               ceiling: float) -> str:
+    """Do the two names disagree about what the thing is?
+
+    Both sides carrying a word the other lacks is a fork in the product line,
+    however ordinary the words: "Anna's Cappuccino Biscuit Thins" scores 80
+    against "Anna's Almond Biscuit" and is a different biscuit.
+
+    One side carrying extra words is usually just the fuller description, and
+    which side matters. Ocado elaborating is harmless — "Serious Pig Snacking
+    Pickles" is "Serious Pig Snacking Pickles Crunchy Tangy Mini Gherkins". The
+    input naming something distinctive that appears nowhere on the page is not,
+    because that word may be the product: "Rummo Mezze Penne Rigate" is a
+    different shape from "Rummo Penne Rigate No. 66".
+    """
+    ja, jb = joined(input_name), joined(page.get("ocado_name", ""))
+    a, b = name_tokens(input_name), name_tokens(page.get("ocado_name", ""))
+
+    def content(tokens: set[str], other: str) -> set[str]:
+        return {t for t in tokens
+                if not t.isdigit() and len(t) > 2 and not respelled(t, other)}
+
+    mine, theirs = content(a - b, jb), content(b - a, ja)
+    if mine and theirs:
+        return f"{'/'.join(sorted(mine)[:3])} vs {'/'.join(sorted(theirs)[:3])}"
+    if mine:
+        rare = sorted(t for t in mine if idf.get(t, ceiling) >= RARE_TOKEN_IDF)
+        if rare:
+            return f"{'/'.join(rare[:3])} not on the page"
+    return ""
 
 
 def input_size(row: pd.Series) -> str:
@@ -309,12 +341,12 @@ def main() -> int:
                 continue
 
             variant_kind, variant_detail = variant_conflict(row["name"], page)
-            stripped = strip_quantities(row["name"])
+            stripped = words(strip_quantities(row["name"]))
             name_score = max(
-                fuzz.token_set_ratio(slugify(stripped),
-                                     slugify(strip_quantities(page.get("ocado_name", "")))),
-                fuzz.token_set_ratio(slugify(stripped),
-                                     slugify(strip_quantities(page.get("ocado_title", "")))),
+                fuzz.token_set_ratio(
+                    stripped, words(strip_quantities(page.get("ocado_name", "")))),
+                fuzz.token_set_ratio(
+                    stripped, words(strip_quantities(page.get("ocado_title", "")))),
             )
             assessed.append({
                 "rank": rank,
@@ -329,6 +361,7 @@ def main() -> int:
                 "variant_kind": variant_kind,
                 "variant": variant_detail,
                 "rare_word": rare_divergence(row["name"], page, idf, ceiling),
+                "divergence": divergence(row["name"], page, idf, ceiling),
             })
 
         # Brand is identity, not evidence to be weighed, and a contradicted
@@ -341,11 +374,13 @@ def main() -> int:
         alive = [a for a in eligible if a["size"] != "mismatch" and a["size"] != "unit_mismatch"]
         alive.sort(key=lambda a: -a["name_score"])
 
-        # A one-sided formulation word or a rare distinguishing word is not
-        # enough to reject on, but it is enough to withhold "confirmed" and put
-        # a person in front of the pair.
+        # Names disagreeing about what the thing is, or a one-sided formulation
+        # word, is not enough to reject on — "Rio Mare Insalatissime Mexican
+        # Style Tuna Salad" and Ocado's "Rio Mare MSC Tuna Salad Mexican Style"
+        # diverge both ways and are the same tin. It is enough to withhold
+        # "confirmed" and put a person in front of the pair.
         def clean(a: dict) -> bool:
-            return not a["variant_kind"] and not a["rare_word"]
+            return not a["variant_kind"] and not a["divergence"]
 
         confirmed = [a for a in alive
                      if a["name_score"] >= NAME_CONFIRM and a["size"] == "match" and clean(a)]
@@ -403,11 +438,12 @@ def main() -> int:
                 "size_verdict": pick["size"],
                 "brand_verdict": pick["brand"],
                 "variant_conflict": pick["variant"],
+                "divergence": pick["divergence"],
                 "rare_word": pick["rare_word"],
             })
         out["alternatives"] = json.dumps(
             [{k: a[k] for k in ("product_id", "ocado_name", "ocado_size", "ocado_brand",
-                                "name_score", "size", "brand", "variant", "rare_word")}
+                                "name_score", "size", "brand", "variant", "divergence")}
              for a in assessed if not pick or a["product_id"] != pick["product_id"]],
             ensure_ascii=False)
         results.append(out)
@@ -416,8 +452,23 @@ def main() -> int:
     out_df.to_csv(args.out_dir / "verified.csv", index=False, encoding="utf-8")
     out_df[out_df.verify_status == "confirmed"].to_csv(
         args.out_dir / "verified_confirmed.csv", index=False, encoding="utf-8")
-    out_df[~out_df.verify_status.isin({"confirmed"})].to_csv(
-        args.out_dir / "verify_review_queue.csv", index=False, encoding="utf-8")
+    # Only the products a person can actually settle. Writing everything that
+    # was not confirmed put 751 wrong-brand pages in a queue titled "review",
+    # where they were 55% of the work and none of the decisions.
+    review = out_df[out_df.verify_status.isin({"needs_review", "ambiguous"})].copy()
+    review.to_csv(args.out_dir / "verify_review_queue.csv", index=False, encoding="utf-8")
+
+    # Same queue as a workbook, because this is the one output a person works
+    # through by hand. "decision" is left empty to be filled in.
+    review.insert(0, "decision", "")
+    write_sheet(args.out_dir / "verify_review_queue.xlsx", review, "review", [
+        "decision", "name", "ocado_name", "input_size", "ocado_size",
+        "divergence", "variant_conflict", "rare_word", "name_score", "ocado_url",
+    ])
+
+    # Everything ruled out, kept separately so the rejections stay auditable.
+    out_df[out_df.verify_status.str.startswith("different")].to_csv(
+        args.out_dir / "verify_rejected.csv", index=False, encoding="utf-8")
 
     counts = out_df.verify_status.value_counts().to_dict()
     (args.out_dir / "verify_stats.json").write_text(
