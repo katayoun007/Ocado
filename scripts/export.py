@@ -122,6 +122,8 @@ def main() -> int:
             "ocado_url": v.ocado_url,
             "ocado_name": v.ocado_name,
             "ocado_size": v.ocado_size,
+            "ocado_image_main": page.get("ocado_image_main", ""),
+            "ocado_images_other": page.get("ocado_images_other") or [],
             "verify_status": v.verify_status,
             "name_score": v.name_score,
         }

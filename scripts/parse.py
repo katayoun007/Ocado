@@ -64,6 +64,15 @@ CAPS_MAX_SHARE = 0.6
 
 NUM = re.compile(r"(-?\d+(?:[.,]\d+)?)\s*([a-zA-Zµ%]+)?")
 
+# Product images are served as /images-v3/{tenant}/{image}/{size}.{ext}. The
+# tenant uuid is constant across the site, the second identifies the image, and
+# the last segment is a rendition — every size exists for every image, so the
+# largest can be requested directly. Verified: the constructed 1280 webp returns
+# 200 image/webp.
+IMAGE_URL = re.compile(
+    r"https://www\.ocado\.com/images-v3/([0-9a-f-]{36})/([0-9a-f-]{36})/\d+x\d+\.\w+")
+IMAGE_RENDITION = "1280x1280.webp"
+
 
 def strip_noise(soup: BeautifulSoup) -> None:
     """Ocado's footer carries its own h2s, which would anchor phantom sections."""
@@ -94,7 +103,7 @@ def section_strings(heading: Tag) -> list[NavigableString]:
     # gets glued to the front of the body.
     own = {id(d) for d in heading.descendants}
 
-    out: list[NavigableString] = []
+    out: list = []
     for node in heading.next_elements:
         if id(node) in own:
             continue
@@ -102,9 +111,18 @@ def section_strings(heading: Tag) -> list[NavigableString]:
             m = HEADING.match(node.name or "")
             if m and int(m.group(1)) <= start:
                 break
+            # <br> separates siblings rather than containing them, so it leaves
+            # no trace in a text node's ancestry. Carried along explicitly or a
+            # <br>-delimited nutrition panel collapses into a single line.
+            if node.name == "br":
+                out.append(node)
         elif isinstance(node, NavigableString) and str(node).strip():
             out.append(node)
     return out
+
+
+def is_break(node) -> bool:
+    return isinstance(node, Tag) and node.name == "br"
 
 
 def _block_id(node: NavigableString) -> int | None:
@@ -132,14 +150,19 @@ def text_of(strings: list[NavigableString]) -> str:
     """
     parts: list[str] = []
     previous: object = object()
+    forced = False
     for node in strings:
+        if is_break(node):
+            forced = True
+            continue
         text = str(node).strip()
         if not text:
             continue
         block = _block_id(node)
-        parts.append("\n" if parts and block != previous else " ")
+        parts.append("\n" if parts and (forced or block != previous) else " ")
         parts.append(text)
         previous = block
+        forced = False
 
     joined = "".join(parts)
     joined = re.sub(r"[ \t]{2,}", " ", joined)
@@ -153,6 +176,8 @@ def list_of(strings: list[NavigableString]) -> list[str]:
     loose: list[NavigableString] = []
 
     for node in strings:
+        if is_break(node):
+            continue
         li = _ancestor(node, "li")
         if li is None:
             loose.append(node)
@@ -204,7 +229,11 @@ def rich_of(strings: list[NavigableString]) -> dict:
     emphasised: list[str] = []
     previous: object = object()
 
+    forced = False
     for node in strings:
+        if is_break(node):
+            forced = True
+            continue
         text = str(node).strip()
         if not text:
             continue
@@ -217,7 +246,7 @@ def rich_of(strings: list[NavigableString]) -> dict:
                 emph = True
                 break
 
-        separator = "\n" if plain and _block_id(node) != previous else " "
+        separator = "\n" if plain and (forced or _block_id(node) != previous) else " "
         plain.append(separator)
         md.append(separator)
         plain.append(text)
@@ -225,6 +254,7 @@ def rich_of(strings: list[NavigableString]) -> dict:
         if emph:
             emphasised.append(text)
         previous = _block_id(node)
+        forced = False
 
     def tidy(parts: list[str]) -> str:
         text = "".join(parts)
@@ -265,6 +295,42 @@ def parse_number(cell: str) -> list[dict]:
     return out
 
 
+def table_from_text(text: str) -> dict | None:
+    """Recover a nutrition panel that was typed out rather than marked up.
+
+    Shape is a column caption followed by one 'label value' pair per line:
+
+        Per 100g / Per 100ml:
+        Energy Kj   2881
+        Fat g       63g
+    """
+    lines = [line.strip() for line in (text or "").split("\n") if line.strip()]
+    if not lines:
+        return None
+
+    column, rows, notes = "", [], []
+    pair = re.compile(r"^(?P<label>.*?[A-Za-z)])[\s:]+(?P<value>[\d.,]+\s*[a-zA-Zµ%]*)$")
+
+    for line in lines:
+        if not column and re.search(r"\bper\b", line, re.I) and not pair.match(line):
+            column = line.rstrip(":").strip()
+            continue
+        m = pair.match(line)
+        if m:
+            label = m.group("label").strip()
+            value = m.group("value").strip()
+            key = column or "value"
+            rows.append({"label": label, "values": {key: value},
+                         "parsed": {key: parse_number(value)}})
+        else:
+            notes.append(line)
+
+    if not rows:
+        return None
+    return {"columns": [column or "value"], "rows": rows, "notes": notes,
+            "source": "text"}
+
+
 def table_of(strings: list[NavigableString]) -> dict | None:
     """Columns are data, not schema (section 8.6).
 
@@ -277,7 +343,9 @@ def table_of(strings: list[NavigableString]) -> dict | None:
         if table is not None:
             break
     if table is None:
-        return None
+        # Some suppliers type the panel out as <br>-separated lines instead of
+        # marking up a table. Same information, no <table> to find.
+        return table_from_text(text_of(strings))
 
     rows = table.find_all("tr")
     if not rows:
@@ -345,6 +413,7 @@ def structured_data(soup: BeautifulSoup) -> dict:
                 "brand": brand or "",
                 "size": item.get("size", ""),
                 "gtin": str(item.get("gtin13") or item.get("gtin") or ""),
+                "image": item.get("image") or [],
                 "price": offers.get("price", ""),
                 "currency": offers.get("priceCurrency", ""),
                 "availability": str(offers.get("availability", "")).rsplit("/", 1)[-1],
@@ -352,10 +421,46 @@ def structured_data(soup: BeautifulSoup) -> dict:
     return {}
 
 
+def image_urls(html: str, structured: dict) -> tuple[str, list[str]]:
+    """Collect product images at the largest rendition.
+
+    The primary comes from the JSON-LD `image` array, which is the page naming
+    its own main image rather than us guessing from document order. The rest of
+    the gallery is picked up from the srcset attributes.
+    """
+    gallery: list[str] = []
+    seen: set[str] = set()
+
+    def add(tenant: str, image: str) -> str:
+        url = f"https://www.ocado.com/images-v3/{tenant}/{image}/{IMAGE_RENDITION}"
+        if image not in seen:
+            seen.add(image)
+            gallery.append(url)
+        return url
+
+    primary = ""
+    declared = structured.get("image") or []
+    for url in [declared] if isinstance(declared, str) else declared:
+        m = IMAGE_URL.match(str(url))
+        if m:
+            primary = add(m.group(1), m.group(2))
+            break
+
+    for tenant, image in IMAGE_URL.findall(html):
+        add(tenant, image)
+
+    if not primary and gallery:
+        primary = gallery[0]
+    # Hand back the main image on its own and the rest as extras, so a consumer
+    # never has to know that the first element was special.
+    return primary, [url for url in gallery if url != primary]
+
+
 def parse_page(html: str, product_id: str) -> dict:
     soup = BeautifulSoup(html, "lxml")
     # Read the JSON-LD before stripping noise — it lives in a <script>.
     structured = structured_data(soup)
+    main_image, other_images = image_urls(html, structured)
     strip_noise(soup)
     h1 = soup.find("h1")
     record: dict = {
@@ -367,6 +472,8 @@ def parse_page(html: str, product_id: str) -> dict:
         "ocado_gtin": structured.get("gtin", ""),
         "ocado_price": structured.get("price", ""),
         "ocado_availability": structured.get("availability", ""),
+        "ocado_image_main": main_image,
+        "ocado_images_other": other_images,
         "headings_seen": [],
     }
 
