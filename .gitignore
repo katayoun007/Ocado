@@ -1,0 +1,18 @@
+# Code only. This repository is public, and everything below is either
+# somebody else's content or LemonSalt's commercial data.
+
+# Cached copies of Ocado's own pages — 102 MB of their HTML.
+raw/
+
+# Sitemap snapshots and the index derived from them.
+data/sitemaps/
+data/catalogue.parquet
+
+# LemonSalt's product list, prices and stock state, plus everything derived
+# from it: match candidates, review queues and the extracted output.
+data/
+out/
+
+__pycache__/
+*.pyc
+.venv/
