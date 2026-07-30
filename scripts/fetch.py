@@ -35,6 +35,12 @@ BACKOFF_BASE = 4.0
 # A page this small is a challenge interstitial or an error, not a product.
 MIN_PAGE_BYTES = 20_000
 
+# Once the WAF starts challenging it does not stop, and the retry loop above
+# turns every remaining target into three requests that all fail. Give up on
+# the run instead: the cache makes resuming free, so there is nothing to lose
+# by stopping early and nothing to gain by hammering.
+MAX_CONSECUTIVE_BLOCKED = 5
+
 
 def normalise_id(value: object) -> str:
     """Product ids are opaque strings, never numbers.
@@ -68,7 +74,10 @@ def main() -> int:
     ap.add_argument("--manifest", default=Path("F:/Ocado/data/fetch_manifest.jsonl"), type=Path)
     ap.add_argument("--tiers", default="auto,review")
     ap.add_argument("--top-n", type=int, default=3)
-    ap.add_argument("--limit", type=int, default=0, help="stop after N fetches (calibration run)")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="stop after N fetches; 0 means NO limit, i.e. fetch everything")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="report the counts and exit without making any request")
     args = ap.parse_args()
 
     args.raw_dir.mkdir(parents=True, exist_ok=True)
@@ -80,10 +89,11 @@ def main() -> int:
         pending = pending[: args.limit]
 
     print(f"targets {len(targets):,} | cached {cached:,} | to fetch {len(pending):,}")
-    if not pending:
+    if args.dry_run or not pending:
         return 0
 
     counts = {"ok": 0, "404": 0, "failed": 0}
+    consecutive_blocked = 0
     with args.manifest.open("a", encoding="utf-8") as manifest, \
             requests.Session(impersonate="chrome", headers=HEADERS, timeout=60) as session:
         for n, (pid, url) in enumerate(pending, 1):
@@ -123,6 +133,12 @@ def main() -> int:
             manifest.flush()
             key = "ok" if record["status"] == "ok" else ("404" if record["status"] == "404" else "failed")
             counts[key] += 1
+
+            consecutive_blocked = consecutive_blocked + 1 if record["status"] == "blocked" else 0
+            if consecutive_blocked >= MAX_CONSECUTIVE_BLOCKED:
+                print(f"  {n}/{len(pending)}: {consecutive_blocked} blocked in a row — "
+                      f"stopping. Check the UK IP, then re-run to resume.")
+                break
 
             if n % 25 == 0 or n == len(pending):
                 print(f"  {n:>4}/{len(pending)}  ok={counts['ok']} 404={counts['404']} failed={counts['failed']}")
