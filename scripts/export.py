@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -27,6 +28,26 @@ CONTENT_FIELDS = [
 USABLE = {"confirmed", "probable_size_unknown", "same_product_other_pack"}
 
 FLAT_LIMIT = 4000
+
+# The fourteen declarable allergens of EU 1169/2011 Annex II, with the words a
+# label actually uses. Only for deciding whether an unemphasised ingredient list
+# is suspicious: strawberry jam has nothing to emphasise, so alarming on it
+# buries the cases that matter under a hundred that do not.
+ALLERGEN_WORDS = {
+    "wheat", "rye", "barley", "oats", "oat", "spelt", "kamut", "gluten",
+    "crustacean", "prawn", "shrimp", "crab", "lobster",
+    "egg", "eggs", "fish", "anchovy", "anchovies", "tuna", "salmon", "cod",
+    "peanut", "peanuts", "soy", "soya", "soybean", "soybeans",
+    # No bare "butter": butter beans are a legume, and the word also carries
+    # peanut, cocoa and shea butter. Milk is named by the other six.
+    "milk", "cream", "cheese", "yoghurt", "yogurt", "whey", "lactose",
+    "almond", "almonds", "hazelnut", "hazelnuts", "walnut", "walnuts",
+    "cashew", "cashews", "pecan", "pecans", "pistachio", "pistachios",
+    "macadamia", "brazil", "nut", "nuts",
+    "celery", "celeriac", "mustard", "sesame", "sulphite", "sulphites",
+    "sulphur", "lupin", "mollusc", "molluscs", "squid", "mussel", "mussels",
+    "oyster", "oysters", "clam", "clams", "snail", "snails",
+}
 
 
 def flatten(value: object) -> str:
@@ -49,9 +70,14 @@ def quality_checks(record: dict) -> list[str]:
     ingredients = record.get("ingredients") or {}
     if isinstance(ingredients, dict) and ingredients.get("text"):
         # The single most important check. If the emphasis markup changes, the
-        # output still looks entirely reasonable and is entirely wrong.
+        # output still looks entirely reasonable and is entirely wrong. Restricted
+        # to lists that name a declarable allergen, because those are the only
+        # ones where finding no emphasis is evidence of anything.
         if not ingredients.get("emphasised"):
-            flags.append("ingredients_without_emphasis")
+            words = set(re.findall(r"[a-z]+", ingredients["text"].lower()))
+            hits = sorted(words & ALLERGEN_WORDS)
+            if hits:
+                flags.append(f"allergen_present_unmarked:{','.join(hits[:4])}")
         else:
             allergen = (record.get("allergen_information") or {})
             allergen_text = (allergen.get("text") if isinstance(allergen, dict) else "") or ""

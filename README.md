@@ -63,6 +63,37 @@ dropped the allergens of eleven products in silence. `parse.py` treats
 capitalisation as a fourth emphasis signal, but only when the surrounding text
 is mixed case, since `E621 MONOSODIUM L-GLUTAMATE` singles out nothing.
 
+**Brand decides, and a score cannot outvote it.** The worst failures all looked
+like good matches: "Bodrum Red Split Lentils" against Ocado's own red split
+lentils, "TRS All Purpose Seasoning" against M&S's, "Saloio Extra Virgin Olive
+Oil" against El Molino's. Five of six words agree, so `token_set_ratio` scores
+them in the high eighties. Calibrating on the matches already believed settled
+the question: of 119 confirmed, only two disagreed on the brand the page states,
+and both of those two were wrong. So brand is now checked before any score is
+read, and a candidate that fails it is out. It moved 751 products out of the
+answer and three wrong ones out of an earlier export.
+
+Three things had to be right for that rule to work. A brand word shared by
+enough distinct brands identifies none of them — "Ahmad Tea" was confirmed
+against "Brew Tea Co" on the strength of "tea" — so the generic ones are counted
+out of the 712 brands the pages state rather than listed by hand. "Lingham's" and
+"Linghams" have to compare equal, which means comparing the separator-free forms,
+and that test needs a length floor because "M&S" reduces to "ms", which is inside
+"bodrumsunfloweroil". And Ocado sometimes credits the distributor, leaving the
+real brand in the name — "Brindisa Ortiz Yellowfin Tuna" — so the input's own
+leading word appearing in the page name counts as agreement too.
+
+**Rare words separate products; common words do not.** "La Costena Salsa
+Mexicana Casera" and "La Costena Salsa Ranchera" share brand and pack size and
+differ only in the last word. "El Yucateco Achiote Seasoning Paste" and "El
+Yucateco Achiote Paste" also differ by a word, and are the same product. What
+tells them apart is how rare the odd word is, measured against the catalogue.
+Measuring it also showed the rule cannot be allowed to reject: at the same
+rarity sit genuine pairs separated by a parent brand ("Nestle Carnation" /
+"Carnation"), a spelling ("Lemonade" / "Limonade") and pure tokenisation
+("Soy Bean" / "Soybean"). So it withholds `confirmed` and asks for a human,
+rather than throwing the product away.
+
 **The matching stage should not reject.** Slug similarity cannot distinguish a
 real match from a miss: "Regal Original Cake Rusks" scored 59.3 against Ocado's
 `regal-original-cake-rusk`, the same product. The gate is now set for recall and
@@ -86,7 +117,14 @@ catalogue rather than a guess about a score.
 
 `export.py` runs the checks that catch silent failures:
 
-- ingredients present but no emphasis found — the signal that markup changed
+- an ingredient list that names a declarable allergen with nothing emphasised —
+  the signal that the markup changed. Restricted to lists that actually name one:
+  checking every list flagged 112 products, almost all of them strawberry jam and
+  sea salt with no allergen to mark, which buried the ten real cases
 - emphasised allergens absent from the Allergen Information text
 - more than 100g of a nutrient per 100g, meaning a column was misread
 - input name and Ocado name disagreeing, meaning the match was wrong
+
+The coverage rule from the plan is what proves the parser is not at fault: for
+every field, the number of pages where the heading is present but the value came
+out empty is zero. Empty means Ocado did not publish the section.
